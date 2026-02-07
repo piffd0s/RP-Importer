@@ -17,6 +17,7 @@
       "vulnerability-research-and-exploit-development",
       "ui-ux-and-visualization"
     ],
+    "logoPath": "logo.svg",
     "keywords": [
       "rop",
       "gadgets",
