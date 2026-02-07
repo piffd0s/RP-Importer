@@ -1,0 +1,38 @@
+{
+  "IDAMetadataDescriptorVersion": 1,
+  "plugin": {
+    "name": "rpp-gadget-importer",
+    "entryPoint": "rpp_gadget_importer.py",
+    "version": "1.0.0",
+    "idaVersions": ["9.0", "9.1", "9.2"],
+    "platforms": [
+      "windows-x86_64",
+      "linux-x86_64",
+      "macos-x86_64",
+      "macos-aarch64"
+    ],
+    "description": "Import rp++ ROP gadget output into IDA with color-coded annotations, comments, and a browsable gadget list.",
+    "license": "MIT",
+    "categories": [
+      "vulnerability-research-and-exploit-development",
+      "ui-ux-and-visualization"
+    ],
+    "keywords": [
+      "rop",
+      "gadgets",
+      "rp++",
+      "exploit-development",
+      "return-oriented-programming",
+      "binary-exploitation"
+    ],
+    "urls": {
+      "repository": "https://github.com/piffd0s/RP-Importer"
+    },
+    "authors": [
+      {
+        "name": "Chris Hernandez",
+        "email": "chernandez@hex-rays.com"
+      }
+    ]
+  }
+}
