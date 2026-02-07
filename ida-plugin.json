@@ -1,8 +1,8 @@
 {
   "IDAMetadataDescriptorVersion": 1,
   "plugin": {
-    "name": "rpp-gadget-importer",
-    "entryPoint": "rpp_gadget_importer.py",
+    "name": "rpp-importer",
+    "entryPoint": "rpp-import.py",
     "version": "1.0.0",
     "idaVersions": ["9.0", "9.1", "9.2"],
     "platforms": [
