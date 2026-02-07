@@ -5,9 +5,11 @@ An IDA Pro plugin that imports [rp++](https://github.com/0vercl0k/rp) output and
 Built for exploit developers and vulnerability researchers who use rp++ for ROP gadget discovery.
 
 ![Gadget Browser](screenshots/gadget_browser.png)
+
 *Browse, search, and jump to gadgets from a dedicated list view with type classification.*
 
 ![Import Summary](screenshots/import_summary.png)
+
 *60,770 gadgets imported and categorized in seconds.*
 
 ## Features
