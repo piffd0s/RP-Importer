@@ -1,13 +1,9 @@
 """
 rp++ Gadget Importer Plugin for IDA Pro (HCLI / Plugin Manager compatible)
 ===========================================================================
+Imports rp++ output, annotates IDA with colors/comments, and persists
+gadget data inside the IDB via netnodes so you never need to re-import.
 
-
-Install via HCLI:
-    hcli plugin install rpp-gadget-importer
-
-Manual install:
-    Copy this folder to $IDAUSR/plugins/rpp-gadget-importer/
 
 Usage:
     - Right-click in disassembly -> "rp++ Gadgets" submenu
@@ -15,10 +11,12 @@ Usage:
     - Hotkey: Ctrl+Shift+Z
 """
 
+import json
 import re
 import ida_bytes
 import ida_kernwin
 import ida_nalt
+import ida_netnode
 import ida_idaapi
 import idc
 import idaapi
@@ -29,18 +27,109 @@ import idaapi
 PLUGIN_NAME    = "rp++ Gadget Importer"
 PLUGIN_HOTKEY  = "Ctrl+Shift+Z"
 PLUGIN_COMMENT = "Import and annotate rp++ ROP gadgets with color coding"
-PLUGIN_VERSION = "1.0.0"
+PLUGIN_VERSION = "1.1.0"
 
-COLOR_RET   = 0xAAFFAA  # green
-COLOR_CALL  = 0xAAEEFF  # yellow/orange
-COLOR_JMP   = 0xAAAAFF  # red
-COLOR_OTHER = 0xDDDDDD  # grey
+COLOR_RET   = 0xAAFFAA
+COLOR_CALL  = 0xAAEEFF
+COLOR_JMP   = 0xAAAAFF
+COLOR_OTHER = 0xDDDDDD
 
 GADGET_RE = re.compile(
     r'^(0x[0-9a-fA-F]+):\s+(.+?)\s*;\s*\(\d+ found\)\s*$'
 )
 
 TAG_PREFIX = "ROP"
+
+# Netnode name for persistent storage in the IDB
+NETNODE_NAME = "$ rpp_gadget_importer"
+
+# Blob tags (single ASCII char) — used with getblob/setblob
+BLOB_TAG_GADGETS = ord('G')  # gadget data (arbitrary size)
+BLOB_TAG_META    = ord('M')  # meta JSON (small)
+
+# --------------------------------------------------------------------------
+# IDB persistence via netnodes — blob storage
+#
+# supvals are limited to MAXSPECSIZE (~1024 bytes), so we use the
+# blob API (setblob/getblob) which supports arbitrary sizes.
+# --------------------------------------------------------------------------
+
+def _get_node():
+    """Get or create our netnode."""
+    return ida_netnode.netnode(NETNODE_NAME, 0, True)
+
+
+def save_gadgets_to_idb(gadgets, base_delta):
+    """Persist gadgets into the IDB using blob storage."""
+    node = _get_node()
+
+    # Serialize gadgets
+    payload = json.dumps([[a, d] for a, d in gadgets]).encode("utf-8")
+
+    # Store gadgets as a blob (no size limit)
+    node.setblob(payload, 0, BLOB_TAG_GADGETS)
+
+    # Store meta as a separate small blob
+    meta = json.dumps({
+        "version": PLUGIN_VERSION,
+        "count": len(gadgets),
+        "base_delta": base_delta,
+    }).encode("utf-8")
+    node.setblob(meta, 0, BLOB_TAG_META)
+
+    print("[rp++] Saved {} gadgets to IDB ({:.1f} MB)"
+          .format(len(gadgets), len(payload) / (1024 * 1024)))
+
+
+def load_gadgets_from_idb():
+    """Load persisted gadgets from the IDB. Returns (gadgets, base_delta) or (None, None)."""
+    node = ida_netnode.netnode(NETNODE_NAME, 0, False)
+    if node == ida_netnode.BADNODE:
+        return None, None
+
+    # Read meta blob
+    raw_meta = node.getblob(0, BLOB_TAG_META)
+    if not raw_meta:
+        return None, None
+
+    try:
+        meta = json.loads(raw_meta.decode("utf-8").rstrip('\x00'))
+    except (json.JSONDecodeError, ValueError) as e:
+        print("[rp++] Failed to read meta from IDB: {}".format(e))
+        return None, None
+
+    base_delta = meta.get("base_delta", 0)
+
+    # Read gadgets blob
+    raw_gadgets = node.getblob(0, BLOB_TAG_GADGETS)
+    if not raw_gadgets:
+        print("[rp++] No gadget data blob found in IDB")
+        return None, None
+
+    try:
+        gadgets = [(a, d) for a, d in json.loads(raw_gadgets.decode("utf-8").rstrip('\x00'))]
+        return gadgets, base_delta
+    except (json.JSONDecodeError, ValueError) as e:
+        print("[rp++] Failed to parse gadgets from IDB: {}".format(e))
+        return None, None
+
+
+def delete_gadgets_from_idb():
+    """Remove persisted gadget data from the IDB."""
+    node = ida_netnode.netnode(NETNODE_NAME, 0, False)
+    if node != ida_netnode.BADNODE:
+        node.delblob(0, BLOB_TAG_GADGETS)
+        node.delblob(0, BLOB_TAG_META)
+        print("[rp++] Cleared gadget data from IDB")
+
+
+def has_saved_gadgets():
+    """Check if we have gadgets stored in the IDB."""
+    node = ida_netnode.netnode(NETNODE_NAME, 0, False)
+    if node == ida_netnode.BADNODE:
+        return False
+    return bool(node.getblob(0, BLOB_TAG_META))
+
 
 # --------------------------------------------------------------------------
 # Core logic
@@ -89,7 +178,7 @@ def apply_gadgets(gadgets, base_delta=0):
     return counts
 
 
-def clear_gadgets(gadgets, base_delta=0):
+def clear_gadget_annotations(gadgets, base_delta=0):
     for addr, disasm in gadgets:
         ea = addr + base_delta
         idc.set_color(ea, idc.CIC_ITEM, 0xFFFFFFFF)
@@ -127,7 +216,7 @@ def format_summary(total, counts):
 
 
 # --------------------------------------------------------------------------
-# Shared state
+# Shared runtime state
 # --------------------------------------------------------------------------
 class _GadgetState:
     gadgets = []
@@ -135,6 +224,18 @@ class _GadgetState:
     loaded = False
 
 _state = _GadgetState()
+
+
+def _load_state_from_idb():
+    """Try to restore runtime state from IDB on plugin init."""
+    gadgets, delta = load_gadgets_from_idb()
+    if gadgets:
+        _state.gadgets = gadgets
+        _state.base_delta = delta
+        _state.loaded = True
+        return True
+    return False
+
 
 # --------------------------------------------------------------------------
 # Import workflows
@@ -159,10 +260,16 @@ def _do_import(text):
         gadgets = [(a, d) for a, d in gadgets if classify_gadget(d) == "ret"]
         print("[rp++] Filtered to {} RET gadgets".format(len(gadgets)))
 
+    # Apply visual annotations
     counts = apply_gadgets(gadgets, base_delta)
+
+    # Update runtime state
     _state.gadgets = gadgets
     _state.base_delta = base_delta
     _state.loaded = True
+
+    # Persist to IDB
+    save_gadgets_to_idb(gadgets, base_delta)
 
     summary = format_summary(len(gadgets), counts)
     print("[rp++] " + summary)
@@ -183,23 +290,78 @@ def import_from_clipboard():
         _do_import(text)
 
 
+def reapply_colors():
+    """Re-apply colors/comments from IDB-stored gadgets (e.g. after reopening)."""
+    if not _state.loaded:
+        if not _load_state_from_idb():
+            ida_kernwin.info("No gadgets stored in this IDB.")
+            return
+    counts = apply_gadgets(_state.gadgets, _state.base_delta)
+    summary = "Re-applied from IDB:\n" + format_summary(len(_state.gadgets), counts)
+    print("[rp++] " + summary)
+    ida_kernwin.info(summary)
+
+
 def clear_current():
     if not _state.loaded:
-        ida_kernwin.info("No gadgets currently loaded.")
+        if not _load_state_from_idb():
+            ida_kernwin.info("No gadgets to clear.")
+            return
+
+    choice = ida_kernwin.ask_buttons(
+        "Annotations Only", "Annotations + IDB Data", "Cancel", 1,
+        "What to clear?\n\n"
+        "• Annotations Only: remove colors/comments, keep data in IDB\n"
+        "• Annotations + IDB Data: remove everything, next time\n"
+        "  you open this IDB the gadgets will be gone")
+    if choice == 0:
         return
-    clear_gadgets(_state.gadgets, _state.base_delta)
+
+    clear_gadget_annotations(_state.gadgets, _state.base_delta)
     n = len(_state.gadgets)
-    _state.gadgets = []
-    _state.loaded = False
-    print("[rp++] Cleared {} gadgets".format(n))
-    ida_kernwin.info("Cleared {} gadget annotations.".format(n))
+
+    if choice == -1:  # full clear
+        delete_gadgets_from_idb()
+        _state.gadgets = []
+        _state.loaded = False
+        print("[rp++] Cleared {} annotations + IDB data".format(n))
+        ida_kernwin.info("Cleared {} annotations and removed data from IDB.".format(n))
+    else:
+        print("[rp++] Cleared {} annotations (data kept in IDB)".format(n))
+        ida_kernwin.info("Cleared {} annotations.\nData is still in the IDB — "
+                         "use 'Re-apply Colors' to restore.".format(n))
 
 
 def jump_to_gadget():
-    if not _state.loaded or not _state.gadgets:
-        ida_kernwin.info("No gadgets loaded. Import first.")
-        return
+    if not _state.loaded:
+        if not _load_state_from_idb():
+            ida_kernwin.info("No gadgets in this IDB. Import first.")
+            return
     GadgetChooser(_state.gadgets, _state.base_delta).Show()
+
+
+def show_idb_info():
+    """Show info about what's stored in the current IDB."""
+    gadgets, delta = load_gadgets_from_idb()
+    if not gadgets:
+        ida_kernwin.info("No rp++ gadgets stored in this IDB.")
+        return
+
+    types = {"ret": 0, "call": 0, "jmp": 0, "other": 0}
+    for _, d in gadgets:
+        types[classify_gadget(d)] += 1
+
+    msg = (
+        "rp++ data stored in IDB:\n\n"
+        "  Total gadgets: {}\n"
+        "  Base delta:    0x{:X}\n\n"
+        "  RET:   {}\n"
+        "  CALL:  {}\n"
+        "  JMP:   {}\n"
+        "  OTHER: {}"
+    ).format(len(gadgets), delta,
+             types["ret"], types["call"], types["jmp"], types["other"])
+    ida_kernwin.info(msg)
 
 
 # --------------------------------------------------------------------------
@@ -209,7 +371,7 @@ def jump_to_gadget():
 class GadgetChooser(ida_kernwin.Choose):
     def __init__(self, gadgets, base_delta):
         super().__init__(
-            "rp++ Gadgets",
+            "rp++ Gadgets ({} loaded)".format(len(gadgets)),
             [["Address", 18], ["Type", 6], ["Gadget", 70]],
             flags=ida_kernwin.Choose.CH_MODAL
         )
@@ -262,21 +424,39 @@ class JumpAction(ida_kernwin.action_handler_t):
     def update(self, ctx):
         return ida_kernwin.AST_ENABLE_ALWAYS
 
+class ReapplyAction(ida_kernwin.action_handler_t):
+    def activate(self, ctx):
+        reapply_colors()
+        return 1
+    def update(self, ctx):
+        return ida_kernwin.AST_ENABLE_ALWAYS
+
+class InfoAction(ida_kernwin.action_handler_t):
+    def activate(self, ctx):
+        show_idb_info()
+        return 1
+    def update(self, ctx):
+        return ida_kernwin.AST_ENABLE_ALWAYS
+
 # Action IDs
-ACT_FILE  = "rpp:import_file"
-ACT_PASTE = "rpp:import_paste"
-ACT_CLEAR = "rpp:clear"
-ACT_JUMP  = "rpp:jump"
+ACT_FILE    = "rpp:import_file"
+ACT_PASTE   = "rpp:import_paste"
+ACT_CLEAR   = "rpp:clear"
+ACT_JUMP    = "rpp:jump"
+ACT_REAPPLY = "rpp:reapply"
+ACT_INFO    = "rpp:info"
 
 ACTIONS = [
-    (ACT_FILE,  "rp++ Import from File",      ImportFileAction(), "Ctrl+Shift+R"),
-    (ACT_PASTE, "rp++ Import from Clipboard",  ImportPasteAction(), None),
-    (ACT_CLEAR, "rp++ Clear Gadget Markings",  ClearAction(), None),
-    (ACT_JUMP,  "rp++ Browse Gadgets",         JumpAction(), None),
+    (ACT_FILE,    "rp++ Import from File",         ImportFileAction(),  "Ctrl+Shift+Z"),
+    (ACT_PASTE,   "rp++ Import from Clipboard",    ImportPasteAction(), None),
+    (ACT_JUMP,    "rp++ Browse Gadgets",            JumpAction(),       None),
+    (ACT_REAPPLY, "rp++ Re-apply Colors from IDB",  ReapplyAction(),    None),
+    (ACT_CLEAR,   "rp++ Clear Gadget Markings",     ClearAction(),      None),
+    (ACT_INFO,    "rp++ IDB Storage Info",           InfoAction(),       None),
 ]
 
 # --------------------------------------------------------------------------
-# UI hooks — inject into right-click context menu
+# UI hooks
 # --------------------------------------------------------------------------
 
 class RPPUIHooks(ida_kernwin.UI_Hooks):
@@ -284,14 +464,9 @@ class RPPUIHooks(ida_kernwin.UI_Hooks):
         wtype = ida_kernwin.get_widget_type(widget)
         if wtype in (ida_kernwin.BWN_DISASM, ida_kernwin.BWN_PSEUDOCODE):
             ida_kernwin.attach_action_to_popup(widget, popup, "-", None)
-            ida_kernwin.attach_action_to_popup(widget, popup, ACT_FILE,
-                "rp++ Gadgets/")
-            ida_kernwin.attach_action_to_popup(widget, popup, ACT_PASTE,
-                "rp++ Gadgets/")
-            ida_kernwin.attach_action_to_popup(widget, popup, ACT_JUMP,
-                "rp++ Gadgets/")
-            ida_kernwin.attach_action_to_popup(widget, popup, ACT_CLEAR,
-                "rp++ Gadgets/")
+            for act_id, _, _, _ in ACTIONS:
+                ida_kernwin.attach_action_to_popup(
+                    widget, popup, act_id, "rp++ Gadgets/")
 
 
 # --------------------------------------------------------------------------
@@ -317,8 +492,15 @@ class RPPGadgetPlugin(ida_idaapi.plugin_t):
         self.hooks = RPPUIHooks()
         self.hooks.hook()
 
-        print("[rp++] Plugin v{} loaded. Right-click -> 'rp++ Gadgets' or {}"
-              .format(PLUGIN_VERSION, PLUGIN_HOTKEY))
+        # Auto-load from IDB if available
+        if _load_state_from_idb():
+            print("[rp++] Plugin v{} loaded. Restored {} gadgets from IDB."
+                  .format(PLUGIN_VERSION, len(_state.gadgets)))
+        else:
+            print("[rp++] Plugin v{} loaded. No saved gadgets in this IDB."
+                  .format(PLUGIN_VERSION))
+
+        print("[rp++] Right-click -> 'rp++ Gadgets' or {}".format(PLUGIN_HOTKEY))
         return ida_idaapi.PLUGIN_KEEP
 
     def run(self, arg):
